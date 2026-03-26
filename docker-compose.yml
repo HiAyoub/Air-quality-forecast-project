@@ -1,0 +1,16 @@
+services:
+  postgres:
+    image: postgis/postgis:15-3.4
+    container_name: airquality_db
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: airquality
+      POSTGRES_USER: airuser
+      POSTGRES_PASSWORD: airpassword
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+volumes:
+  postgres_data:
