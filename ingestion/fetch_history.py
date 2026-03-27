@@ -7,9 +7,10 @@ from datetime import datetime, timedelta
 
 import requests
 from dotenv import load_dotenv
+from sqlalchemy import text
 
 sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
-from db.init import insert_measurement, upsert_station
+from db.__init__ import get_session, insert_measurement, upsert_station
 
 load_dotenv()
 
@@ -20,7 +21,6 @@ logger = logging.getLogger(__name__)
 
 OPENAQ_BASE_URL = "https://api.openaq.org/v3"
 OPENAQ_API_KEY  = os.getenv("OPENAQ_API_KEY", "")
-
 OPEN_METEO_URL  = "https://archive-api.open-meteo.com/v1/archive"
 
 HEADERS = {
@@ -28,26 +28,24 @@ HEADERS = {
     "X-API-Key": OPENAQ_API_KEY,
 }
 
-VILLES_FRANCE = {
-    "Paris":       {"bbox": (48.815, 2.224,  48.902, 2.470),  "lat": 48.8566, "lon": 2.3522},
-    "Lyon":        {"bbox": (45.707, 4.771,  45.808, 4.898),  "lat": 45.7640, "lon": 4.8357},
-    "Marseille":   {"bbox": (43.169, 5.334,  43.381, 5.536),  "lat": 43.2965, "lon": 5.3698},
-    "Bordeaux":    {"bbox": (44.786, -0.638, 44.914, -0.527), "lat": 44.8378, "lon": -0.5792},
-    "Lille":       {"bbox": (50.580, 2.972,  50.700, 3.130),  "lat": 50.6292, "lon": 3.0573},
-    "Toulouse":    {"bbox": (43.533, 1.350,  43.668, 1.506),  "lat": 43.6047, "lon": 1.4442},
-    "Strasbourg":  {"bbox": (48.530, 7.680,  48.620, 7.820),  "lat": 48.5734, "lon": 7.7521},
-}
+DATE_START = (datetime.utcnow() - timedelta(days=90)).strftime("%Y-%m-%d")
+DATE_END   = datetime.utcnow().strftime("%Y-%m-%d")
 
-# Période historique
-DATE_START = (datetime.utcnow() - timedelta(days=90)).strftime("%Y-%m-%dT00:00:00Z")
-DATE_END   = datetime.utcnow().strftime("%Y-%m-%dT00:00:00Z")
+VILLES_COORDS = {
+    "Paris":      {"lat": 48.8566, "lon": 2.3522},
+    "Lyon":       {"lat": 45.7640, "lon": 4.8357},
+    "Marseille":  {"lat": 43.2965, "lon": 5.3698},
+    "Bordeaux":   {"lat": 44.8378, "lon": -0.5792},
+    "Lille":      {"lat": 50.6292, "lon": 3.0573},
+    "Toulouse":   {"lat": 43.6047, "lon": 1.4442},
+    "Strasbourg": {"lat": 48.5734, "lon": 7.7521},
+}
 
 METEO_VARIABLES = [
     "temperature_2m",
     "relative_humidity_2m",
     "windspeed_10m",
     "surface_pressure",
-    "precipitation",
 ]
 
 
@@ -61,7 +59,7 @@ def get_with_retry(url: str, params: dict, max_retries: int = 3) -> dict | None:
                 return response.json()
             if response.status_code in (429, 503):
                 wait = 2 ** (attempt + 1)
-                logger.warning(f"Rate limit ({response.status_code}), retry dans {wait}s...")
+                logger.warning(f"Rate limit, retry dans {wait}s...")
                 time.sleep(wait)
                 continue
             logger.error(f"Erreur HTTP {response.status_code} sur {url}")
@@ -75,117 +73,109 @@ def get_with_retry(url: str, params: dict, max_retries: int = 3) -> dict | None:
     return None
 
 
-# ─── FETCH STATIONS ──────────────────────────────────────────────────────────
+# ─── LECTURE STATIONS EN BASE ────────────────────────────────────────────────
 
-def fetch_stations_for_city(city: str, bbox: tuple) -> list[dict]:
-    lat_min, lon_min, lat_max, lon_max = bbox
-    data = get_with_retry(
-        url=f"{OPENAQ_BASE_URL}/locations",
-        params={"bbox": f"{lon_min},{lat_min},{lon_max},{lat_max}", "limit": 20},
-    )
-    if not data or "results" not in data:
-        return []
-    stations = []
-    for loc in data["results"]:
-        coords = loc.get("coordinates", {})
-        if not coords.get("latitude") or not coords.get("longitude"):
-            continue
-        stations.append({
-            "openaq_id": loc["id"],
-            "name":      loc.get("name", f"Station_{loc['id']}"),
-            "city":      city,
-            "latitude":  coords["latitude"],
-            "longitude": coords["longitude"],
-        })
-    logger.info(f"{city} : {len(stations)} station(s)")
-    return stations
+def get_stations_from_db() -> list[dict]:
+    """
+    Lit toutes les stations avec openaq_id depuis la base.
+    On utilise ces IDs pour requêter l'historique OpenAQ.
+    """
+    sql = text("""
+        SELECT id, name, city, openaq_id, latitude, longitude
+        FROM stations
+        WHERE openaq_id IS NOT NULL
+        ORDER BY city, name
+    """)
+    with get_session() as session:
+        result = session.execute(sql)
+        rows = [dict(zip(result.keys(), row)) for row in result.fetchall()]
+    logger.info(f"{len(rows)} stations avec openaq_id trouvées en base")
+    return rows
 
 
 # ─── FETCH HISTORIQUE POLLUTION ───────────────────────────────────────────────
 
-def fetch_historical_measurements(openaq_location_id: int, date_from: str, date_to: str) -> list[dict]:
+def fetch_sensors_for_location(openaq_id: int) -> list[int]:
     """
-    Récupère l'historique des mesures PM2.5 et NO2 pour une station
-    sur une période donnée, avec pagination automatique.
+    Récupère les sensor_ids d'une station pour pm25 et no2.
+    Dans l'API v3, les mesures historiques passent par /sensors/{id}/measurements.
+    """
+    data = get_with_retry(
+        url=f"{OPENAQ_BASE_URL}/locations/{openaq_id}/sensors",
+        params={},
+    )
+    if not data or "results" not in data:
+        return []
 
-    Args:
-        openaq_location_id: ID OpenAQ de la station.
-        date_from: Date de début ISO8601.
-        date_to: Date de fin ISO8601.
+    sensor_ids = []
+    for sensor in data["results"]:
+        param = sensor.get("parameter", {}).get("name", "").lower()
+        if param in ("pm25", "no2", "pm10"):  # Parfois PM10 contient PM2.5
+            sensor_ids.append({
+                "sensor_id": sensor["id"],
+                "parameter": "pm25" if param == "pm10" else param,
+            })
+    return sensor_ids
 
-    Returns:
-        Liste de mesures {parameter, value, timestamp}.
+
+def fetch_sensor_history(sensor_id: int, parameter: str, date_from: str, date_to: str) -> list[dict]:
+    """
+    Récupère l'historique d'un sensor par tranches de 7 jours
+    pour éviter les timeouts sur les longues périodes.
     """
     mesures  = []
-    page     = 1
-    limit    = 1000
+    start    = datetime.strptime(date_from, "%Y-%m-%d")
+    end      = datetime.strptime(date_to,   "%Y-%m-%d")
+    chunk    = timedelta(days=7)
+    current  = start
 
-    while True:
+    while current < end:
+        chunk_end = min(current + chunk, end)
+
         data = get_with_retry(
-            url=f"{OPENAQ_BASE_URL}/measurements",
+            url=f"{OPENAQ_BASE_URL}/sensors/{sensor_id}/measurements",
             params={
-                "locations_id": openaq_location_id,
-                "date_from":    date_from,
-                "date_to":      date_to,
-                "limit":        limit,
-                "page":         page,
-                "parameters_id": "2,5",  # 2=pm25, 5=no2 dans OpenAQ
+                "date_from": current.strftime("%Y-%m-%dT00:00:00Z"),
+                "date_to":   chunk_end.strftime("%Y-%m-%dT23:59:59Z"),
+                "limit":     1000,
+                "page":      1,
+                "order_by":  "datetime",
+                "order":     "asc",
             },
         )
 
-        if not data or "results" not in data or not data["results"]:
-            break
+        if data and "results" in data:
+            for m in data["results"]:
+                value  = m.get("value")
+                dt     = m.get("period", {}).get("datetimeTo", {})
+                ts_str = dt.get("utc") if isinstance(dt, dict) else None
+                if value is None or not ts_str:
+                    continue
+                mesures.append({
+                    "parameter": parameter,
+                    "value":     value,
+                    "timestamp": ts_str,
+                })
 
-        for m in data["results"]:
-            param = m.get("parameter", "").lower()
-            if param not in ("pm25", "no2"):
-                continue
-            ts_raw = m.get("date", {})
-            ts_str = ts_raw.get("utc") if isinstance(ts_raw, dict) else None
-            if not ts_str or m.get("value") is None:
-                continue
-            mesures.append({
-                "parameter": param,
-                "value":     m["value"],
-                "timestamp": ts_str,
-            })
-
-        # Arrêter si moins de résultats que la limite (dernière page)
-        if len(data["results"]) < limit:
-            break
-
-        page += 1
-        time.sleep(0.2)
+        current = chunk_end + timedelta(days=1)
+        time.sleep(0.3)
 
     return mesures
 
 
 # ─── FETCH HISTORIQUE MÉTÉO ───────────────────────────────────────────────────
 
-def fetch_historical_meteo(city: str, lat: float, lon: float, date_from: str, date_to: str) -> list[dict]:
-    """
-    Récupère l'historique météo horaire depuis Open-Meteo Archive API.
-
-    Args:
-        city: Nom de la ville.
-        lat: Latitude.
-        lon: Longitude.
-        date_from: Date début (YYYY-MM-DD).
-        date_to: Date fin (YYYY-MM-DD).
-
-    Returns:
-        Liste de dicts météo avec timestamp.
-    """
+def fetch_historical_meteo(city: str, lat: float, lon: float) -> list[dict]:
+    """Récupère l'historique météo horaire depuis Open-Meteo Archive API."""
     data = get_with_retry(
         url=OPEN_METEO_URL,
         params={
             "latitude":   lat,
             "longitude":  lon,
-            "start_date": date_from[:10],
-            "end_date":   date_to[:10],
+            "start_date": DATE_START,
+            "end_date":   DATE_END,
             "hourly":     ",".join(METEO_VARIABLES),
             "timezone":   "UTC",
-            "timeformat": "iso8601",
         },
     )
 
@@ -195,12 +185,8 @@ def fetch_historical_meteo(city: str, lat: float, lon: float, date_from: str, da
 
     hourly     = data["hourly"]
     timestamps = hourly.get("time", [])
-    temps      = hourly.get("temperature_2m", [])
-    humidities = hourly.get("relative_humidity_2m", [])
-    winds      = hourly.get("windspeed_10m", [])
-    pressures  = hourly.get("surface_pressure", [])
+    records    = []
 
-    records = []
     for i, ts_str in enumerate(timestamps):
         try:
             ts = datetime.fromisoformat(ts_str)
@@ -208,114 +194,112 @@ def fetch_historical_meteo(city: str, lat: float, lon: float, date_from: str, da
             continue
         records.append({
             "timestamp":   ts,
-            "temperature": temps[i]      if i < len(temps)      else None,
-            "humidity":    humidities[i] if i < len(humidities) else None,
-            "wind_speed":  winds[i]      if i < len(winds)      else None,
-            "pressure":    pressures[i]  if i < len(pressures)  else None,
+            "temperature": hourly.get("temperature_2m",      [None] * (i+1))[i],
+            "humidity":    hourly.get("relative_humidity_2m",[None] * (i+1))[i],
+            "wind_speed":  hourly.get("windspeed_10m",       [None] * (i+1))[i],
+            "pressure":    hourly.get("surface_pressure",    [None] * (i+1))[i],
         })
 
-    logger.info(f"{city} météo historique : {len(records)} enregistrements")
+    logger.info(f"{city} météo : {len(records)} enregistrements")
     return records
-
-
-# ─── GROUPER PAR TIMESTAMP ────────────────────────────────────────────────────
-
-def group_by_timestamp(mesures: list[dict]) -> dict[str, dict]:
-    grouped: dict[str, dict] = {}
-    for m in mesures:
-        ts = m["timestamp"]
-        if not ts:
-            continue
-        if ts not in grouped:
-            grouped[ts] = {"pm25": None, "no2": None}
-        if m["parameter"] == "pm25":
-            grouped[ts]["pm25"] = m["value"]
-        elif m["parameter"] == "no2":
-            grouped[ts]["no2"] = m["value"]
-    return grouped
 
 
 # ─── PIPELINE PRINCIPAL ──────────────────────────────────────────────────────
 
 def run_historical_ingestion() -> None:
     """
-    Récupère 90 jours d'historique pollution + météo pour toutes les villes.
+    Pipeline historique complet :
+    1. Lit les stations depuis la base (avec openaq_id)
+    2. Pour chaque station : récupère les sensors puis leur historique
+    3. Récupère l'historique météo par ville
     """
-    logger.info(f"=== Ingestion historique du {DATE_START[:10]} au {DATE_END[:10]} ===")
+    logger.info(f"=== Ingestion historique {DATE_START} → {DATE_END} ===")
     total_pollution = 0
     total_meteo     = 0
 
-    for city, config in VILLES_FRANCE.items():
-        logger.info(f"--- {city} ---")
-        bbox = config["bbox"]
-        lat  = config["lat"]
-        lon  = config["lon"]
+    stations = get_stations_from_db()
 
-        # 1. Stations
-        stations = fetch_stations_for_city(city, bbox)
-        if not stations:
+    # ── Pollution ──
+    for station in stations:
+        # Ignorer les stations météo standalone
+        if station["name"].startswith("Météo_"):
             continue
 
-        # 2. Historique pollution par station
-        for station in stations:
-            station_id = upsert_station(
-                name=station["name"], city=station["city"],
-                latitude=station["latitude"], longitude=station["longitude"],
-            )
+        logger.info(f"  {station['city']} | {station['name']} (openaq_id={station['openaq_id']})")
 
-            mesures = fetch_historical_measurements(
-                openaq_location_id=station["openaq_id"],
+        sensors = fetch_sensors_for_location(station["openaq_id"])
+        if not sensors:
+            logger.info(f"    Aucun sensor PM2.5/NO2")
+            continue
+
+        # Regrouper les mesures par timestamp
+        grouped: dict[str, dict] = {}
+        for sensor in sensors:
+            mesures = fetch_sensor_history(
+                sensor_id=sensor["sensor_id"],
+                parameter=sensor["parameter"],
                 date_from=DATE_START,
                 date_to=DATE_END,
             )
+            for m in mesures:
+                ts = m["timestamp"]
+                if ts not in grouped:
+                    grouped[ts] = {"pm25": None, "no2": None}
+                grouped[ts][m["parameter"]] = m["value"]
 
-            if not mesures:
-                logger.info(f"  {station['name']} : aucun historique")
+        # Insérer en base
+        inserted = 0
+        for ts_str, values in grouped.items():
+            try:
+                ts = datetime.fromisoformat(ts_str.replace("Z", "+00:00")).replace(tzinfo=None)
+            except ValueError:
                 continue
-
-            grouped = group_by_timestamp(mesures)
-            inserted = 0
-            for ts_str, values in grouped.items():
-                try:
-                    ts = datetime.fromisoformat(ts_str.replace("Z", "+00:00")).replace(tzinfo=None)
-                except ValueError:
-                    continue
-                ok = insert_measurement(
-                    station_id=station_id,
-                    timestamp_utc=ts,
-                    pm25=values["pm25"],
-                    no2=values["no2"],
-                )
-                if ok:
-                    inserted += 1
-
-            total_pollution += inserted
-            logger.info(f"  {station['name']} : {inserted} mesures historiques insérées")
-            time.sleep(0.3)
-
-        # 3. Historique météo
-        meteo_records = fetch_historical_meteo(city, lat, lon, DATE_START, DATE_END)
-        meteo_station_id = upsert_station(
-            name=f"Météo_{city}", city=city, latitude=lat, longitude=lon,
-        )
-        meteo_inserted = 0
-        for record in meteo_records:
             ok = insert_measurement(
-                station_id=meteo_station_id,
-                timestamp_utc=record["timestamp"],
-                temperature=record["temperature"],
-                humidity=record["humidity"],
-                wind_speed=record["wind_speed"],
-                pressure=record["pressure"],
+                station_id=station["id"],
+                timestamp_utc=ts,
+                pm25=values.get("pm25"),
+                no2=values.get("no2"),
             )
             if ok:
-                meteo_inserted += 1
-        total_meteo += meteo_inserted
-        logger.info(f"  {city} météo : {meteo_inserted} enregistrements insérés")
+                inserted += 1
 
-        time.sleep(1)
+        total_pollution += inserted
+        logger.info(f"    {inserted} mesures historiques insérées")
+        time.sleep(0.5)
 
-    logger.info(f"=== Terminé : {total_pollution} mesures pollution + {total_meteo} météo ===")
+    # ── Météo par ville ──
+    logger.info("--- Ingestion météo historique ---")
+    villes_traitees = set()
+
+    for station in stations:
+        city = station["city"]
+        if city in villes_traitees or city not in VILLES_COORDS:
+            continue
+        villes_traitees.add(city)
+
+        coords   = VILLES_COORDS[city]
+        records  = fetch_historical_meteo(city, coords["lat"], coords["lon"])
+        meteo_id = upsert_station(
+            name=f"Météo_{city}", city=city,
+            latitude=coords["lat"], longitude=coords["lon"],
+        )
+        inserted = 0
+        for r in records:
+            ok = insert_measurement(
+                station_id=meteo_id,
+                timestamp_utc=r["timestamp"],
+                temperature=r["temperature"],
+                humidity=r["humidity"],
+                wind_speed=r["wind_speed"],
+                pressure=r["pressure"],
+            )
+            if ok:
+                inserted += 1
+        total_meteo += inserted
+        logger.info(f"  {city} météo : {inserted} enregistrements insérés")
+        time.sleep(0.5)
+
+    logger.info(f"=== Terminé : {total_pollution} pollution + {total_meteo} météo ===")
 
 
 # ─── STANDALONE ──────────────────────────────────────────────────────────────
