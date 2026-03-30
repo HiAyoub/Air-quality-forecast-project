@@ -59,59 +59,35 @@ def add_time_features(df: pd.DataFrame) -> pd.DataFrame:
 # ─── FEATURES DE LAG ─────────────────────────────────────────────────────────
 
 def add_lag_features(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Ajoute les valeurs passées (lags) pour PM2.5 et NO2.
-    Calculé par groupe (city + station_name) pour éviter les fuites entre stations.
-
-    Args:
-        df: DataFrame trié par city + timestamp_utc.
-
-    Returns:
-        DataFrame avec colonnes lag_Xh pour pm25 et no2.
-    """
-    df = df.copy().sort_values(["city", "station_name", "timestamp_utc"])
+    """Lags en nombre de lignes — robuste avec données éparses."""
+    df = df.copy().sort_values(["city", "timestamp_utc"])
 
     for col in TARGET_COLS:
-        for lag in LAG_HOURS:
-            feat_name = f"{col}_lag_{lag}h"
-            df[feat_name] = (
-                df.groupby(["city", "station_name"])[col]
-                .shift(lag)
+        for lag in [1, 2, 7]:
+            df[f"{col}_lag_{lag}d"] = (
+                df.groupby("city")[col].shift(lag)
             )
 
-    n_lags = len(TARGET_COLS) * len(LAG_HOURS)
-    logger.info(f"Features de lag ajoutées : {n_lags} colonnes ({LAG_HOURS}h pour {TARGET_COLS})")
+    logger.info(f"Features de lag ajoutées : 1d, 2d, 7d pour {TARGET_COLS}")
     return df
 
 
-# ─── ROLLING STATISTICS ──────────────────────────────────────────────────────
-
 def add_rolling_features(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Ajoute les statistiques glissantes (moyenne et écart-type)
-    sur fenêtres de 6h et 24h pour PM2.5 et NO2.
-
-    Args:
-        df: DataFrame trié par city + timestamp_utc.
-
-    Returns:
-        DataFrame avec colonnes rolling_mean_Xh et rolling_std_Xh.
-    """
-    df = df.copy().sort_values(["city", "station_name", "timestamp_utc"])
+    """Rolling sur 3 et 7 observations."""
+    df = df.copy().sort_values(["city", "timestamp_utc"])
 
     for col in TARGET_COLS:
-        for window in ROLLING_WINDOWS:
-            grp = df.groupby(["city", "station_name"])[col]
-
-            df[f"{col}_rolling_mean_{window}h"] = (
-                grp.transform(lambda x: x.shift(1).rolling(window, min_periods=1).mean())
+        for window in [3, 7]:
+            df[f"{col}_rolling_mean_{window}d"] = (
+                df.groupby("city")[col]
+                .transform(lambda x: x.shift(1).rolling(window, min_periods=2).mean())
             )
-            df[f"{col}_rolling_std_{window}h"] = (
-                grp.transform(lambda x: x.shift(1).rolling(window, min_periods=1).std())
+            df[f"{col}_rolling_std_{window}d"] = (
+                df.groupby("city")[col]
+                .transform(lambda x: x.shift(1).rolling(window, min_periods=2).std())
             )
 
-    n_rolling = len(TARGET_COLS) * len(ROLLING_WINDOWS) * 2
-    logger.info(f"Features rolling ajoutées : {n_rolling} colonnes (fenêtres {ROLLING_WINDOWS}h)")
+    logger.info(f"Features rolling ajoutées : 3d, 7d pour {TARGET_COLS}")
     return df
 
 
@@ -226,6 +202,22 @@ def build_features(city: str | None = None, run_clean: bool = True) -> pd.DataFr
         logger.warning("DataFrame vide, feature engineering annulé")
         return df
 
+    df = (
+    df.groupby(["city", "timestamp_utc"])
+    .agg({
+        "pm25":        "mean",
+        "no2":         "mean",
+        "temperature": "mean",
+        "humidity":    "mean",
+        "wind_speed":  "mean",
+        "pressure":    "mean",
+        "is_outlier":  "max",
+        "is_imputed":  "max",
+        })
+        .reset_index()
+    )
+    df["station_name"] = df["city"]  # requis par les fonctions suivantes
+    logger.info(f"Après agrégation par ville : {len(df)} lignes")
     df = add_time_features(df)
     df = add_lag_features(df)
     df = add_rolling_features(df)
